@@ -35,6 +35,14 @@
 
 const http = require('http');
 
+// Never let an unhandled rejection or exception die silently.
+process.on('unhandledRejection', (reason) => {
+  console.error('[FATAL] Unhandled rejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] Uncaught exception:', err);
+});
+
 const PORT = process.env.PORT || 3000;
 // Set this on Render as an env var and require it on every request so
 // randos on the internet can't use your server as a free bandwidth relay.
@@ -123,6 +131,7 @@ class TokenCacher {
 // ---------------------------------------------------------------------
 
 async function makeDirectory(tokenCacher, drive, email, directory) {
+  console.log(`[mkdir] requesting mkdir drive=${drive} email=${email} directory=${directory}`);
   const token = await tokenCacher.fetchToken();
   const url = new URL(`https://fs.shade.inc/${drive}/fs/mkdir`);
   url.searchParams.set('email', email);
@@ -133,6 +142,7 @@ async function makeDirectory(tokenCacher, drive, email, directory) {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}` },
   });
+  console.log(`[mkdir] response status=${resp.status}`);
   if (!resp.ok && resp.status !== 409) {
     // 409/"already exists" style responses are fine; anything else isn't.
     const body = await resp.text().catch(() => '');
@@ -141,6 +151,7 @@ async function makeDirectory(tokenCacher, drive, email, directory) {
 }
 
 async function initiateMultipartUpload(tokenCacher, drive, path, partSize) {
+  console.log(`[initiate] drive=${drive} path=${path} partSize=${partSize}`);
   const token = await tokenCacher.fetchToken();
   const resp = await fetch(`https://fs.shade.inc/${drive}/upload/multipart`, {
     method: 'POST',
@@ -150,10 +161,19 @@ async function initiateMultipartUpload(tokenCacher, drive, path, partSize) {
     },
     body: JSON.stringify({ path, partSize }),
   });
-  return jsonOrThrow(resp, 'initiateMultipartUpload');
+  const result = await jsonOrThrow(resp, 'initiateMultipartUpload');
+  console.log(`[initiate] response: ${JSON.stringify(result)}`);
+  if (!result.uploadId) {
+    console.warn('[initiate] WARNING: response has no uploadId field — check API response shape above');
+  }
+  if (!result.token) {
+    console.warn('[initiate] WARNING: response has no token (finishToken) field — subsequent calls will fail');
+  }
+  return result;
 }
 
 async function presignPart(tokenCacher, drive, partNumber, finishToken) {
+  console.log(`[presign] requesting presign for part ${partNumber}`);
   const token = await tokenCacher.fetchToken();
   const url = new URL(`https://fs.shade.inc/${drive}/upload/multipart/part/${partNumber}`);
   url.searchParams.set('token', finishToken);
@@ -162,12 +182,15 @@ async function presignPart(tokenCacher, drive, partNumber, finishToken) {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}` },
   });
-  return jsonOrThrow(resp, `presignPart(${partNumber})`);
+  const result = await jsonOrThrow(resp, `presignPart(${partNumber})`);
+  console.log(`[presign] part ${partNumber} presigned url host=${new URL(result.url).host}`);
+  return result;
 }
 
-async function uploadPart(presigned, buffer) {
+async function uploadPart(presigned, buffer, partNumber) {
   let lastErr;
   for (let attempt = 1; attempt <= MAX_PART_UPLOAD_RETRIES; attempt++) {
+    console.log(`[upload] part ${partNumber} attempt ${attempt}/${MAX_PART_UPLOAD_RETRIES}, ${buffer.length} bytes`);
     try {
       const resp = await fetch(presigned.url, {
         method: 'PUT',
@@ -177,14 +200,17 @@ async function uploadPart(presigned, buffer) {
         },
         body: buffer,
       });
+      console.log(`[upload] part ${partNumber} response status=${resp.status}`);
       if (!(resp.status >= 200 && resp.status < 300)) {
         throw new Error(`UploadPart failed: ${resp.status} ${await resp.text().catch(() => '')}`);
       }
       const etag = resp.headers.get('etag');
       if (!etag) throw new Error('Missing ETag on UploadPart response');
+      console.log(`[upload] part ${partNumber} succeeded, etag=${etag}`);
       return etag;
     } catch (err) {
       lastErr = err;
+      console.error(`[upload] part ${partNumber} attempt ${attempt} failed: ${err.message}`);
       const backoff = Math.min(1000 * 2 ** (attempt - 1), 15000);
       await sleep(backoff);
     }
@@ -193,6 +219,7 @@ async function uploadPart(presigned, buffer) {
 }
 
 async function completeMultipart(tokenCacher, drive, finishToken, parts) {
+  console.log(`[complete] finalizing with ${parts.length} parts: ${JSON.stringify(parts)}`);
   const token = await tokenCacher.fetchToken();
   const url = new URL(`https://fs.shade.inc/${drive}/upload/multipart/complete`);
   url.searchParams.set('token', finishToken);
@@ -205,8 +232,10 @@ async function completeMultipart(tokenCacher, drive, finishToken, parts) {
     },
     body: JSON.stringify({ parts }),
   });
+  const bodyText = await resp.text().catch(() => '');
+  console.log(`[complete] response status=${resp.status} body=${bodyText}`);
   if (!(resp.status >= 200 && resp.status < 300)) {
-    throw new Error(`completeMultipart ${resp.status} ${await resp.text().catch(() => '')}`);
+    throw new Error(`completeMultipart ${resp.status} ${bodyText}`);
   }
 }
 
@@ -221,12 +250,23 @@ async function* chunkStreamIntoParts(readableStream, partSize) {
   const reader = readableStream.getReader();
   let pending = [];
   let pendingLen = 0;
+  let totalReadFromSource = 0;
+  let readCount = 0;
 
   while (true) {
     const { value, done } = await reader.read();
+    readCount += 1;
     if (value) {
+      totalReadFromSource += value.length;
       pending.push(Buffer.from(value));
       pendingLen += value.length;
+      if (readCount % 50 === 0 || readCount <= 5) {
+        console.log(
+          `[download] read#${readCount} chunkBytes=${value.length} totalReadFromSource=${totalReadFromSource} pendingLen=${pendingLen}`
+        );
+      }
+    } else if (!done) {
+      console.log(`[download] read#${readCount} produced no value and not done yet`);
     }
 
     while (pendingLen >= partSize) {
@@ -235,12 +275,18 @@ async function* chunkStreamIntoParts(readableStream, partSize) {
       const rest = combined.subarray(partSize);
       pending = rest.length ? [rest] : [];
       pendingLen = rest.length;
+      console.log(`[download] assembled full part of ${part.length} bytes, ${pendingLen} bytes carried over`);
       yield part;
     }
 
     if (done) {
+      console.log(
+        `[download] source stream done. totalReadFromSource=${totalReadFromSource} leftover pendingLen=${pendingLen}`
+      );
       if (pendingLen > 0) {
-        yield pending.length === 1 ? pending[0] : Buffer.concat(pending, pendingLen);
+        const finalPart = pending.length === 1 ? pending[0] : Buffer.concat(pending, pendingLen);
+        console.log(`[download] yielding final partial part of ${finalPart.length} bytes`);
+        yield finalPart;
       }
       return;
     }
@@ -250,26 +296,39 @@ async function* chunkStreamIntoParts(readableStream, partSize) {
 async function transferUrlToShade({ sourceUrl, driveId, apiKey, destPath, partSizeBytes }, onEvent) {
   const partSize = partSizeBytes || DEFAULT_PART_SIZE;
   const tokenCacher = new TokenCacher(driveId, apiKey);
+  const log = (evt) => {
+    console.log(`[transfer] ${JSON.stringify(evt)}`);
+    onEvent(evt);
+  };
 
-  onEvent({ stage: 'auth', message: 'fetching ShadeFS token' });
+  log({ stage: 'auth', message: 'fetching ShadeFS token' });
   const token = await tokenCacher.fetchToken();
   const decoded = jwtDecode(token);
   const drive = decoded.aud;
   const userEmail = decoded.sub;
+  log({ stage: 'auth-ok', drive, userEmail, tokenExp: decoded.exp });
   if (!userEmail || !drive || Array.isArray(drive)) {
     throw new Error('Bad token: missing sub/aud');
   }
 
   const directory = destPath.substring(0, destPath.lastIndexOf('/'));
   if (directory && directory !== '/') {
-    onEvent({ stage: 'mkdir', message: `ensuring ${directory} exists` });
+    log({ stage: 'mkdir', message: `ensuring ${directory} exists` });
     await makeDirectory(tokenCacher, drive, userEmail, directory);
   } else {
-    onEvent({ stage: 'mkdir', message: 'destination is at drive root, skipping mkdir' });
+    log({ stage: 'mkdir', message: 'destination is at drive root, skipping mkdir' });
   }
 
-  onEvent({ stage: 'download-start', message: `starting download of ${sourceUrl}` });
+  log({ stage: 'download-start', message: `starting download of ${sourceUrl}` });
   const sourceResp = await fetch(sourceUrl);
+  log({
+    stage: 'download-response',
+    status: sourceResp.status,
+    contentLength: sourceResp.headers.get('content-length'),
+    contentType: sourceResp.headers.get('content-type'),
+    contentEncoding: sourceResp.headers.get('content-encoding'),
+    acceptRanges: sourceResp.headers.get('accept-ranges'),
+  });
   if (!sourceResp.ok) {
     throw new Error(`Failed to fetch sourceUrl: ${sourceResp.status} ${sourceResp.statusText}`);
   }
@@ -277,33 +336,55 @@ async function transferUrlToShade({ sourceUrl, driveId, apiKey, destPath, partSi
     throw new Error('sourceUrl response had no readable body');
   }
 
-  onEvent({ stage: 'initiate', message: 'initiating multipart upload' });
+  log({ stage: 'initiate', message: 'initiating multipart upload' });
   const init = await initiateMultipartUpload(tokenCacher, drive, destPath, partSize);
   const finishToken = init.token;
   const confirmedPartSize = init.partSize || partSize;
+  if (!finishToken) {
+    throw new Error('initiateMultipartUpload did not return a finish token — cannot continue');
+  }
+  log({ stage: 'initiate-ok', uploadId: init.uploadId, confirmedPartSize });
 
   const completed = [];
   let partNumber = 1;
   let bytesUploaded = 0;
 
-  for await (const partBuffer of chunkStreamIntoParts(sourceResp.body, confirmedPartSize)) {
-    const presigned = await presignPart(tokenCacher, drive, partNumber, finishToken);
-    const etag = await uploadPart(presigned, partBuffer);
-    completed.push({ partNumber, etag });
-    bytesUploaded += partBuffer.length;
-    onEvent({
-      stage: 'part-uploaded',
-      partNumber,
-      bytesInPart: partBuffer.length,
-      totalBytesUploaded: bytesUploaded,
-    });
-    partNumber += 1;
+  // Heartbeat so the client (and any proxy in front of this server) sees
+  // this is still alive during long, quiet stretches between parts.
+  const heartbeat = setInterval(() => {
+    log({ stage: 'heartbeat', partsSoFar: completed.length, bytesUploaded });
+  }, 15000);
+
+  try {
+    for await (const partBuffer of chunkStreamIntoParts(sourceResp.body, confirmedPartSize)) {
+      log({ stage: 'part-ready', partNumber, bytes: partBuffer.length });
+      const presigned = await presignPart(tokenCacher, drive, partNumber, finishToken);
+      const etag = await uploadPart(presigned, partBuffer, partNumber);
+      completed.push({ partNumber, etag });
+      bytesUploaded += partBuffer.length;
+      log({
+        stage: 'part-uploaded',
+        partNumber,
+        bytesInPart: partBuffer.length,
+        totalBytesUploaded: bytesUploaded,
+      });
+      partNumber += 1;
+    }
+  } finally {
+    clearInterval(heartbeat);
   }
 
-  onEvent({ stage: 'completing', message: 'finalizing multipart upload' });
+  if (completed.length === 0 || bytesUploaded === 0) {
+    throw new Error(
+      'No bytes were read from sourceUrl — the download stream ended without producing any data. ' +
+      'Check that sourceUrl is directly downloadable (not an HTML landing page / redirect chain requiring a browser).'
+    );
+  }
+
+  log({ stage: 'completing', message: `finalizing multipart upload with ${completed.length} parts` });
   await completeMultipart(tokenCacher, drive, finishToken, completed);
 
-  onEvent({
+  log({
     stage: 'done',
     message: 'upload complete',
     totalParts: completed.length,
@@ -360,6 +441,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   const { sourceUrl, driveId, apiKey, destPath, partSizeMB } = body;
+  console.log(`[request] /transfer sourceUrl=${sourceUrl} driveId=${driveId} destPath=${destPath} partSizeMB=${partSizeMB || 'default'}`);
   const missing = ['sourceUrl', 'driveId', 'apiKey', 'destPath'].filter((k) => !body[k]);
   if (missing.length) {
     res.writeHead(400, { 'content-type': 'application/json' });
@@ -372,9 +454,18 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(200, {
     'content-type': 'application/x-ndjson',
     'transfer-encoding': 'chunked',
+    'cache-control': 'no-cache',
+    'x-accel-buffering': 'no', // hint to nginx-style proxies: don't buffer this
   });
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
 
-  const write = (evt) => res.write(JSON.stringify(evt) + '\n');
+  const write = (evt) => {
+    try {
+      res.write(JSON.stringify(evt) + '\n');
+    } catch (err) {
+      console.error(`[response] failed writing to client stream: ${err.message}`);
+    }
+  };
 
   try {
     await transferUrlToShade(
@@ -387,7 +478,9 @@ const server = http.createServer(async (req, res) => {
       },
       write
     );
+    console.log('[request] /transfer completed successfully');
   } catch (err) {
+    console.error(`[request] /transfer failed: ${err.stack || err.message}`);
     write({ stage: 'error', message: err.message });
   } finally {
     res.end();
