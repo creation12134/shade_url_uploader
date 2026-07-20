@@ -509,7 +509,7 @@ async function transferUrlToShade(
         finishToken,
       );
       const etag = await uploadPart(presigned, partBuffer, partNumber);
-      completed.push({ partNumber, etag });
+      completed.push({ PartNumber: partNumber, ETag: etag });
       bytesUploaded += partBuffer.length;
       log({
         stage: "part-uploaded",
