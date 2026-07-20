@@ -252,30 +252,36 @@ async function uploadPart(presigned, buffer, partNumber) {
   );
   for (let attempt = 1; attempt <= MAX_PART_UPLOAD_RETRIES; attempt++) {
     console.log(
-      console.log(`[upload] part ${partNumber} attempt ${attempt}/${MAX_PART_UPLOAD_RETRIES}, ${buffer.length} bytes -> ${presigned.url}`);
-      const startedAt = Date.now();
-      const controller = new AbortController();
-      const timeoutHandle = setTimeout(() => {
-        console.error(`[upload] part ${partNumber} attempt ${attempt} TIMED OUT after ${PART_UPLOAD_TIMEOUT_MS}ms, aborting`);
-        controller.abort(new Error('part upload timeout'));
-      }, PART_UPLOAD_TIMEOUT_MS);
+      `[upload] part ${partNumber} attempt ${attempt}/${MAX_PART_UPLOAD_RETRIES}, ${buffer.length} bytes -> ${presigned.url}`,
+    );
+    const startedAt = Date.now();
+    const controller = new AbortController();
+    const timeoutHandle = setTimeout(() => {
+      console.error(
+        `[upload] part ${partNumber} attempt ${attempt} TIMED OUT after ${PART_UPLOAD_TIMEOUT_MS}ms, aborting`,
+      );
+      controller.abort(new Error("part upload timeout"));
+    }, PART_UPLOAD_TIMEOUT_MS);
 
-      try {
-        // Construct headers, ensuring presigned headers take precedence
-        const uploadHeaders = {
-          ...(presigned.headers || {}),
-        };
-        // Only set Content-Length if not already specified in presigned headers
-        if (!uploadHeaders['Content-Length'] && !uploadHeaders['content-length']) {
-          uploadHeaders['Content-Length'] = String(buffer.length);
-        }
+    try {
+      // Construct headers, ensuring presigned headers take precedence
+      const uploadHeaders = {
+        ...(presigned.headers || {}),
+      };
+      // Only set Content-Length if not already specified in presigned headers
+      if (
+        !uploadHeaders["Content-Length"] &&
+        !uploadHeaders["content-length"]
+      ) {
+        uploadHeaders["Content-Length"] = String(buffer.length);
+      }
 
-        const resp = await fetch(presigned.url, {
-          method: 'PUT',
-          headers: uploadHeaders,
-          body: buffer,
-          signal: controller.signal,
-        });
+      const resp = await fetch(presigned.url, {
+        method: "PUT",
+        headers: uploadHeaders,
+        body: buffer,
+        signal: controller.signal,
+      });
       const elapsedMs = Date.now() - startedAt;
       console.log(
         `[upload] part ${partNumber} response status=${resp.status} elapsedMs=${elapsedMs}`,
