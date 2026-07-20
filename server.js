@@ -260,9 +260,13 @@ async function transferUrlToShade({ sourceUrl, driveId, apiKey, destPath, partSi
     throw new Error('Bad token: missing sub/aud');
   }
 
-  const directory = destPath.substring(0, destPath.lastIndexOf('/')) || '/';
-  onEvent({ stage: 'mkdir', message: `ensuring ${directory} exists` });
-  await makeDirectory(tokenCacher, drive, userEmail, directory);
+  const directory = destPath.substring(0, destPath.lastIndexOf('/'));
+  if (directory && directory !== '/') {
+    onEvent({ stage: 'mkdir', message: `ensuring ${directory} exists` });
+    await makeDirectory(tokenCacher, drive, userEmail, directory);
+  } else {
+    onEvent({ stage: 'mkdir', message: 'destination is at drive root, skipping mkdir' });
+  }
 
   onEvent({ stage: 'download-start', message: `starting download of ${sourceUrl}` });
   const sourceResp = await fetch(sourceUrl);
