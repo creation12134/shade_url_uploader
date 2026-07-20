@@ -88,11 +88,24 @@ class TokenCacher {
       `https://api.shade.inc/workspaces/drives/${encodeURIComponent(this.driveId)}/shade-fs-token`,
       { headers: { Authorization: this.apiKey } }
     );
-    const data = await jsonOrThrow(resp, 'shade-fs-token');
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => '');
+      throw new Error(`shade-fs-token failed: ${resp.status} ${resp.statusText} ${body}`);
+    }
 
-    // Docs are a little loose on the exact response shape; handle both
-    // { token: "..." } and a bare token string just in case.
-    const token = typeof data === 'string' ? data : data.token;
+    // The endpoint returns the raw JWT as plain text (not wrapped in JSON),
+    // so read it as text rather than trying resp.json().
+    const raw = (await resp.text()).trim();
+    let token = raw;
+    // Just in case it's ever double-quoted JSON-string or {"token":"..."}.
+    if (raw.startsWith('"') || raw.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(raw);
+        token = typeof parsed === 'string' ? parsed : parsed.token;
+      } catch {
+        // not JSON after all, fall through with raw as token
+      }
+    }
     if (!token) throw new Error('shade-fs-token response missing token');
 
     const decoded = jwtDecode(token);
