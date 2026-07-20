@@ -75,6 +75,27 @@ function sleep(ms) {
   return new Promise((res) => setTimeout(res, ms));
 }
 
+const DEFAULT_FETCH_TIMEOUT_MS = 2 * 60 * 1000; // 2 min for small API calls
+
+async function fetchWithTimeout(label, url, options = {}, timeoutMs = DEFAULT_FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const startedAt = Date.now();
+  const timeoutHandle = setTimeout(() => {
+    console.error(`[fetch] ${label} TIMED OUT after ${timeoutMs}ms, aborting: ${url}`);
+    controller.abort(new Error(`${label} timeout`));
+  }, timeoutMs);
+  try {
+    const resp = await fetch(url, { ...options, signal: controller.signal });
+    console.log(`[fetch] ${label} -> status=${resp.status} elapsedMs=${Date.now() - startedAt}`);
+    return resp;
+  } catch (err) {
+    console.error(`[fetch] ${label} threw after ${Date.now() - startedAt}ms: ${err.message}`);
+    throw err;
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+}
+
 // ---------------------------------------------------------------------
 // ShadeFS token cache (mirrors tokenCacher.fetchToken() from the docs)
 // ---------------------------------------------------------------------
@@ -92,7 +113,8 @@ class TokenCacher {
       return this.token;
     }
 
-    const resp = await fetch(
+    const resp = await fetchWithTimeout(
+      'shade-fs-token',
       `https://api.shade.inc/workspaces/drives/${encodeURIComponent(this.driveId)}/shade-fs-token`,
       { headers: { Authorization: this.apiKey } }
     );
@@ -138,11 +160,10 @@ async function makeDirectory(tokenCacher, drive, email, directory) {
   url.searchParams.set('path', directory);
   url.searchParams.set('drive', drive);
 
-  const resp = await fetch(url, {
+  const resp = await fetchWithTimeout('mkdir', url, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}` },
   });
-  console.log(`[mkdir] response status=${resp.status}`);
   if (!resp.ok && resp.status !== 409) {
     // 409/"already exists" style responses are fine; anything else isn't.
     const body = await resp.text().catch(() => '');
@@ -153,7 +174,7 @@ async function makeDirectory(tokenCacher, drive, email, directory) {
 async function initiateMultipartUpload(tokenCacher, drive, path, partSize) {
   console.log(`[initiate] drive=${drive} path=${path} partSize=${partSize}`);
   const token = await tokenCacher.fetchToken();
-  const resp = await fetch(`https://fs.shade.inc/${drive}/upload/multipart`, {
+  const resp = await fetchWithTimeout('initiate', `https://fs.shade.inc/${drive}/upload/multipart`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
@@ -178,7 +199,7 @@ async function presignPart(tokenCacher, drive, partNumber, finishToken) {
   const url = new URL(`https://fs.shade.inc/${drive}/upload/multipart/part/${partNumber}`);
   url.searchParams.set('token', finishToken);
 
-  const resp = await fetch(url, {
+  const resp = await fetchWithTimeout(`presign(${partNumber})`, url, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}` },
   });
@@ -187,10 +208,19 @@ async function presignPart(tokenCacher, drive, partNumber, finishToken) {
   return result;
 }
 
+const PART_UPLOAD_TIMEOUT_MS = 5 * 60 * 1000; // 5 min per attempt, then abort + retry
+
 async function uploadPart(presigned, buffer, partNumber) {
   let lastErr;
   for (let attempt = 1; attempt <= MAX_PART_UPLOAD_RETRIES; attempt++) {
-    console.log(`[upload] part ${partNumber} attempt ${attempt}/${MAX_PART_UPLOAD_RETRIES}, ${buffer.length} bytes`);
+    console.log(`[upload] part ${partNumber} attempt ${attempt}/${MAX_PART_UPLOAD_RETRIES}, ${buffer.length} bytes -> ${presigned.url}`);
+    const startedAt = Date.now();
+    const controller = new AbortController();
+    const timeoutHandle = setTimeout(() => {
+      console.error(`[upload] part ${partNumber} attempt ${attempt} TIMED OUT after ${PART_UPLOAD_TIMEOUT_MS}ms, aborting`);
+      controller.abort(new Error('part upload timeout'));
+    }, PART_UPLOAD_TIMEOUT_MS);
+
     try {
       const resp = await fetch(presigned.url, {
         method: 'PUT',
@@ -199,20 +229,29 @@ async function uploadPart(presigned, buffer, partNumber) {
           ...(presigned.headers || {}),
         },
         body: buffer,
+        signal: controller.signal,
       });
-      console.log(`[upload] part ${partNumber} response status=${resp.status}`);
+      const elapsedMs = Date.now() - startedAt;
+      console.log(`[upload] part ${partNumber} response status=${resp.status} elapsedMs=${elapsedMs}`);
       if (!(resp.status >= 200 && resp.status < 300)) {
         throw new Error(`UploadPart failed: ${resp.status} ${await resp.text().catch(() => '')}`);
       }
       const etag = resp.headers.get('etag');
-      if (!etag) throw new Error('Missing ETag on UploadPart response');
-      console.log(`[upload] part ${partNumber} succeeded, etag=${etag}`);
+      if (!etag) {
+        const headerDump = [...resp.headers.entries()].map(([k, v]) => `${k}=${v}`).join(', ');
+        throw new Error(`Missing ETag on UploadPart response. Headers received: ${headerDump}`);
+      }
+      console.log(`[upload] part ${partNumber} succeeded, etag=${etag}, elapsedMs=${elapsedMs}`);
       return etag;
     } catch (err) {
+      const elapsedMs = Date.now() - startedAt;
       lastErr = err;
-      console.error(`[upload] part ${partNumber} attempt ${attempt} failed: ${err.message}`);
+      console.error(`[upload] part ${partNumber} attempt ${attempt} failed after ${elapsedMs}ms: ${err.message}`);
       const backoff = Math.min(1000 * 2 ** (attempt - 1), 15000);
+      console.log(`[upload] part ${partNumber} backing off ${backoff}ms before retry`);
       await sleep(backoff);
+    } finally {
+      clearTimeout(timeoutHandle);
     }
   }
   throw lastErr;
@@ -224,7 +263,7 @@ async function completeMultipart(tokenCacher, drive, finishToken, parts) {
   const url = new URL(`https://fs.shade.inc/${drive}/upload/multipart/complete`);
   url.searchParams.set('token', finishToken);
 
-  const resp = await fetch(url, {
+  const resp = await fetchWithTimeout('complete', url, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
@@ -320,7 +359,7 @@ async function transferUrlToShade({ sourceUrl, driveId, apiKey, destPath, partSi
   }
 
   log({ stage: 'download-start', message: `starting download of ${sourceUrl}` });
-  const sourceResp = await fetch(sourceUrl);
+  const sourceResp = await fetchWithTimeout('download-connect', sourceUrl, {}, DEFAULT_FETCH_TIMEOUT_MS);
   log({
     stage: 'download-response',
     status: sourceResp.status,
