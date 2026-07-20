@@ -148,7 +148,7 @@ async function initiateMultipartUpload(tokenCacher, drive, path, partSize) {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ path, PART_SIZE: partSize }),
+    body: JSON.stringify({ path, partSize }),
   });
   return jsonOrThrow(resp, 'initiateMultipartUpload');
 }
